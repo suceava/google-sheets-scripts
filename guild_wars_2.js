@@ -46,158 +46,134 @@ function formatCopperToGSC(value) {
  * IDs are looked up from the "Items" sheet (Name + ID).
  */
 function updateTradingPostPrices() {
-  const mainSheetNames = ['Prices'];
-  const rawSheetName = 'Items';
-
-  const nameCol = 1; // A
-  const buyCol  = 2; // B
-  const sellCol = 3; // C
-
   const ss = SpreadsheetApp.getActive();
-  const raw = ss.getSheetByName(rawSheetName);
-  if (!raw) throw new Error('Lookup sheet "' + rawSheetName + '" not found.');
+  const items = ss.getSheetByName('Items');
+  const pricesSheet = ss.getSheetByName('Prices');
+  if (!items || !pricesSheet) throw new Error('Missing "Items" or "Prices" sheet');
 
-  // ---- Build Name -> ID map + vendor metadata from Items sheet ----
-  const rawLastRow = raw.getLastRow();
-  if (rawLastRow < 2) return;
+  const norm = (v) => String(v ?? "").replace(/\u00A0/g, " ").trim().toLowerCase();
 
-  // A: name, B: id, C: mode, D: manual cost
-  const rawData = raw.getRange(2, 1, rawLastRow - 1, 4).getValues();
+  // --- Load Items meta: A name, B id, C mode, D manual cost ---
+  const itemsLast = items.getLastRow();
+  const itemsData = itemsLast >= 2 ? items.getRange(2, 1, itemsLast - 1, 4).getValues() : [];
   const nameToId = {};
-  const vendorNames = new Set();
-  const vendorCostMap = {};
+  const vendorCost = {}; // key -> number|null
 
-  rawData.forEach(row => {
-    const rawName = row[0];
-    const id = row[1];
-    const mode = (row[2] || "").toString().toUpperCase(); // ALT / VENDOR / BLOCK / ""
-    const manual = row[3];
+  itemsData.forEach(r => {
+    const name = r[0];
+    if (!name) return;
+    const key = norm(name);
+    const id = r[1];
+    const mode = String(r[2] || "").toUpperCase().trim();
+    const manual = (r[3] !== "" && r[3] != null) ? Number(r[3]) : null;
 
-    if (!rawName) return;
-    const key = String(rawName).trim().toLowerCase();
-
-    if (mode === 'VENDOR') {
-      vendorNames.add(key);
-      vendorCostMap[key] = (manual !== "" && manual != null) ? Number(manual) : null;
-    }
-
-    if (id) {
-      nameToId[key] = id;
-    }
+    if (id) nameToId[key] = String(id);
+    if (mode === "VENDOR") vendorCost[key] = manual; // may be null
   });
 
-  mainSheetNames.forEach(sheetName => {
-    const main = ss.getSheetByName(sheetName);
-    if (!main) return;
+  // --- Load Prices names + existing buy/sell ---
+  const firstDataRow = 2;
+  const lastRow = pricesSheet.getLastRow();
+  if (lastRow < firstDataRow) return;
 
-    const firstDataRow = 2;
-    const lastRow = main.getLastRow();
-    if (lastRow < firstDataRow) return;
+  const numRows = lastRow - firstDataRow + 1;
+  const names = pricesSheet.getRange(firstDataRow, 1, numRows, 1).getValues();    // col A
+  const existing = pricesSheet.getRange(firstDataRow, 2, numRows, 2).getValues(); // cols B:C
 
-    const numRows = lastRow - firstDataRow + 1;
-    const names = main.getRange(firstDataRow, nameCol, numRows, 1).getValues();
+  // Prepare output = start with existing values, then overwrite where we have new info
+  const out = existing.map(r => [r[0], r[1]]);
 
-    const idToRows = {};
-    const idSet = new Set();
-    let missingIdCount = 0;
+  // Build ID -> rowIndexes (0-based within out)
+  const idToIdxs = {};
+  const ids = [];
+  const idSet = new Set();
 
-    names.forEach((row, i) => {
-      const nameCell = row[0];
-      if (!nameCell) return;
+  names.forEach((row, i) => {
+    const nameCell = row[0];
+    if (!nameCell) return;
+    const key = norm(nameCell);
 
-      const key = String(nameCell).trim().toLowerCase();
-      const rowNum = firstDataRow + i;
-
-      // 🔹 Handle VENDOR items: no API, just write manual cost
-      if (vendorNames.has(key)) {
-        const manual = vendorCostMap[key];
-        if (manual != null) {
-          main.getRange(rowNum, buyCol).setValue(manual);
-          main.getRange(rowNum, sellCol).setValue(manual);
-        } else {
-          Logger.log('VENDOR item "' + nameCell + '" has no ManualCost in Items sheet.');
-        }
-        return; // do NOT add to idSet / API list
+    // VENDOR override
+    if (Object.prototype.hasOwnProperty.call(vendorCost, key)) {
+      const manual = vendorCost[key];
+      if (manual != null && !Number.isNaN(manual)) {
+        out[i][0] = manual; // buy
+        out[i][1] = manual; // sell
+      } else {
+        // If vendor item has no manual cost, you can blank it or leave existing:
+        // out[i][0] = ""; out[i][1] = "";
       }
-
-      const id = nameToId[key];
-      if (!id) {
-        missingIdCount++;
-        return; // leave Buy/Sell unchanged
-      }
-
-      const idStr = String(id);
-      if (!idToRows[idStr]) idToRows[idStr] = [];
-      idToRows[idStr].push(rowNum);
-      idSet.add(idStr);
-    });
-
-    const apiIds = Array.from(idSet);
-    if (apiIds.length === 0) {
-      Logger.log('No IDs to update for sheet "' + sheetName + '". Missing-ID rows: ' + missingIdCount);
       return;
     }
 
-    const chunkSize = 150;
-    const urlBase = "https://api.guildwars2.com/v2/commerce/prices?ids=";
-    const returnedIds = new Set();
+    const id = nameToId[key];
+    if (!id) return;
 
-    for (let start = 0; start < apiIds.length; start += chunkSize) {
-      const chunk = apiIds.slice(start, start + chunkSize);
-      const url = urlBase + encodeURIComponent(chunk.join(","));
+    if (!idToIdxs[id]) idToIdxs[id] = [];
+    idToIdxs[id].push(i);
 
-      let response, code, data;
-      try {
-        response = UrlFetchApp.fetch(url, { muteHttpExceptions: true });
-        code = response.getResponseCode();
-        if (code !== 200 && code !== 206) {
-          Logger.log('GW2 API error ' + code + ' for URL: ' + url);
-          continue;
-        }
-        data = JSON.parse(response.getContentText());
-      } catch (e) {
-        Logger.log('Fetch/parse failed for chunk starting at ' + start + ': ' + e);
-        continue;
-      }
-
-      data.forEach(entry => {
-        const idStr = String(entry.id);
-        returnedIds.add(idStr);
-
-        const rows = idToRows[idStr];
-        if (!rows || rows.length === 0) return;
-
-        const buyCopper  = entry.buys  && entry.buys.unit_price  ? entry.buys.unit_price  : '';
-        const sellCopper = entry.sells && entry.sells.unit_price ? entry.sells.unit_price : '';
-
-        const buyStr  = buyCopper  !== '' ? formatCopperToGSC(buyCopper)  : '';
-        const sellStr = sellCopper !== '' ? formatCopperToGSC(sellCopper) : '';
-
-        rows.forEach(r => {
-          main.getRange(r, buyCol).setValue(buyStr);
-          main.getRange(r, sellCol).setValue(sellStr);
-        });
-      });
-
-      Utilities.sleep(300);
+    if (!idSet.has(id)) {
+      idSet.add(id);
+      ids.push(id);
     }
-
-    const notReturned = apiIds.filter(id => !returnedIds.has(id));
-    if (notReturned.length > 0) {
-      Logger.log(
-        'Sheet "' + sheetName + '": ' +
-        notReturned.length + ' IDs not returned by /commerce/prices (likely non-tradable). Example: ' +
-        notReturned.slice(0, 10).join(', ')
-      );
-    }
-
-    Logger.log(
-      'Finished "' + sheetName + '". Updated unique IDs: ' + apiIds.length +
-      '. Rows with names missing IDs: ' + missingIdCount +
-      '.'
-    );
   });
+
+  if (ids.length === 0) {
+    pricesSheet.getRange(firstDataRow, 2, numRows, 2).setValues(out);
+    return;
+  }
+
+  // --- Fetch TP prices in chunks ---
+  const chunkSize = 200; // bump to 200
+  const urlBase = "https://api.guildwars2.com/v2/commerce/prices?ids=";
+  const returned = new Set();
+
+  for (let start = 0; start < ids.length; start += chunkSize) {
+    const chunk = ids.slice(start, start + chunkSize);
+    const url = urlBase + encodeURIComponent(chunk.join(","));
+
+    let resp, code, data;
+    try {
+      resp = UrlFetchApp.fetch(url, { muteHttpExceptions: true });
+      code = resp.getResponseCode();
+      if (code !== 200 && code !== 206) continue;
+      data = JSON.parse(resp.getContentText());
+    } catch (e) {
+      continue;
+    }
+
+    data.forEach(entry => {
+      const id = String(entry.id);
+      returned.add(id);
+      const idxs = idToIdxs[id];
+      if (!idxs) return;
+
+      const buyCopper  = entry.buys  && entry.buys.unit_price  ? entry.buys.unit_price  : null; // buy order
+      const sellCopper = entry.sells && entry.sells.unit_price ? entry.sells.unit_price : null; // sell listing
+
+      const buyVal  = buyCopper  != null ? formatCopperToGSC(buyCopper)  : "";
+      const sellVal = sellCopper != null ? formatCopperToGSC(sellCopper) : "";
+
+      idxs.forEach(i => {
+        out[i][0] = buyVal;
+        out[i][1] = sellVal;
+      });
+    });
+
+    // Optional: smaller sleep or none; API is usually fine without it
+    // Utilities.sleep(100);
+  }
+
+  // Optional: if an ID wasn’t returned (non-tradable), blank it instead of leaving old values:
+  // ids.forEach(id => {
+  //   if (returned.has(id)) return;
+  //   (idToIdxs[id] || []).forEach(i => { out[i][0] = ""; out[i][1] = ""; });
+  // });
+
+  // --- One single write back ---
+  pricesSheet.getRange(firstDataRow, 2, numRows, 2).setValues(out);
 }
+
 
 
 /**
@@ -290,7 +266,6 @@ function refreshCosts() {
   if (!items) throw new Error('Sheet "Items" not found');
   items.getRange("Z1").setValue(new Date()); // bump refresh token
 }
-
 /***************
  * GW2 Crafting Cost Engine (optimized)
  *
@@ -304,6 +279,7 @@ function refreshCosts() {
  *  VENDOR  = must use ManualCost (Items!D) for that item
  *  ALT     = allow chain to continue even if no TP price (uses craft if exists else 0)
  *  BLOCK   = break chain (unpriceable)
+ *  CRAFT   = must craft this item if used as an ingredient (ignore TP even if it exists)
  *
  * Custom functions:
  *  =CRAFTCOST(A3:A500)       -> STRICT craft-only cost for the item (top-level must have recipe) using EFFECTIVE cost for ingredients
@@ -338,7 +314,6 @@ function CLEAR_CRAFT_CACHE() {
 function getEngine_() {
   if (_engine) return _engine;
 
-  // Try short-lived cache to avoid rereading sheets repeatedly during recalcs
   const cache = CacheService.getScriptCache();
   const cached = cache.get(_GW2_COST_ENGINE_CACHE_KEY);
   if (cached) {
@@ -346,9 +321,7 @@ function getEngine_() {
       const parsed = JSON.parse(cached);
       _engine = buildEngineFromData_(parsed);
       return _engine;
-    } catch (e) {
-      // fall through to rebuild
-    }
+    } catch (e) {}
   }
 
   const ss = SpreadsheetApp.getActive();
@@ -359,15 +332,13 @@ function getEngine_() {
     throw new Error('Missing sheet: need "Prices", "Recipes", and "Items".');
   }
 
-  // Read only the used ranges (fast)
-  const pricesData = readUsed_(pricesSheet, 3);  // A:C
+  const pricesData = readUsed_(pricesSheet, 3);   // A:C
   const recipesData = readUsed_(recipesSheet, 4); // A:D
   const itemsData = readUsed_(itemsSheet, 4);     // A:D
 
   const data = { pricesData, recipesData, itemsData };
   _engine = buildEngineFromData_(data);
 
-  // Cache for ~5 minutes (tune if desired)
   cache.put(_GW2_COST_ENGINE_CACHE_KEY, JSON.stringify(data), 300);
   return _engine;
 }
@@ -380,14 +351,12 @@ function buildEngineFromData_(data) {
       .toLowerCase();
 
   // ---- Prices map: name -> buyOrder ----
-  // Expect headers row 1
   const priceMap = new Map();
   for (let i = 1; i < data.pricesData.length; i++) {
     const row = data.pricesData[i];
     const k = norm(row[0]);
     if (!k) continue;
     const buy = Number(row[1]);
-    // Store 0 if missing/blank; caller decides what "hasTP" means
     priceMap.set(k, isFinite(buy) ? buy : 0);
   }
 
@@ -419,11 +388,9 @@ function buildEngineFromData_(data) {
     if (!recipesByOutput.has(outKey)) {
       recipesByOutput.set(outKey, { outQty: outQty, ingredients: [] });
     }
-    // If multiple rows have inconsistent outQty, first one wins (fine for your “single recipe” rule)
     recipesByOutput.get(outKey).ingredients.push({ key: ingKey, qty: ingQty });
   }
 
-  // ---- Memoized recursive evaluators ----
   const memoEff = new Map();
   const memoStrict = new Map();
 
@@ -432,22 +399,23 @@ function buildEngineFromData_(data) {
     if (memoEff.has(key)) return memoEff.get(key);
 
     stack = stack || [];
-    if (stack.includes(key)) return memoEff.set(key, "").get(key); // loop guard
+    if (stack.includes(key)) return memoEff.set(key, "").get(key);
 
     const meta = metaMap.get(key) || null;
+    const mode = meta ? meta.mode : "";
     const tpBuy = priceMap.has(key) ? priceMap.get(key) : 0;
     const hasTP = tpBuy > 0;
     const recipe = recipesByOutput.get(key) || null;
 
     // BLOCK always breaks
-    if (meta && meta.mode === "BLOCK") {
+    if (mode === "BLOCK") {
       memoEff.set(key, "");
       return "";
     }
 
     // VENDOR requires manual cost
-    if (meta && meta.mode === "VENDOR") {
-      const v = meta.cost;
+    if (mode === "VENDOR") {
+      const v = meta ? meta.cost : null;
       memoEff.set(key, v == null ? "" : v);
       return memoEff.get(key);
     }
@@ -458,7 +426,7 @@ function buildEngineFromData_(data) {
       return meta.cost;
     }
 
-    // Compute strict craft cost if recipe exists (but ingredients use EFFECTIVE)
+    // Compute craft cost if recipe exists (ingredients use EFFECTIVE)
     let craft = null;
     if (recipe) {
       let total = 0;
@@ -474,10 +442,22 @@ function buildEngineFromData_(data) {
     }
 
     // ALT: keep chain alive even if missing TP and missing recipe
-    if (meta && meta.mode === "ALT") {
+    if (mode === "ALT") {
       const v = craft != null ? craft : 0;
       memoEff.set(key, v);
       return v;
+    }
+
+    // CRAFT: MUST craft when used as ingredient (ignore TP)
+    if (mode === "CRAFT") {
+      // If there's a recipe, use it; if not, break/flag
+      if (craft != null) {
+        memoEff.set(key, craft);
+        return craft;
+      }
+      // If you prefer "N/A" instead of blank here, change "" to "N/A"
+      memoEff.set(key, "");
+      return memoEff.get(key);
     }
 
     // Normal: min(TP buy, craft) when both exist; else whichever exists
@@ -497,25 +477,24 @@ function buildEngineFromData_(data) {
     if (memoStrict.has(key)) return memoStrict.get(key);
 
     stack = stack || [];
-    if (stack.includes(key)) return memoStrict.set(key, "").get(key); // loop guard
+    if (stack.includes(key)) return memoStrict.set(key, "").get(key);
 
     const meta = metaMap.get(key) || null;
+    const mode = meta ? meta.mode : "";
     const recipe = recipesByOutput.get(key) || null;
 
-    // BLOCK: break
-    if (meta && meta.mode === "BLOCK") {
+    if (mode === "BLOCK") {
       memoStrict.set(key, "");
       return "";
     }
 
-    // If output is VENDOR/manual-only and you still call strict craft: treat as that cost (useful for non-TP components)
-    if (meta && meta.mode === "VENDOR") {
-      const v = meta.cost;
+    if (mode === "VENDOR") {
+      const v = meta ? meta.cost : null;
       memoStrict.set(key, v == null ? "" : v);
       return memoStrict.get(key);
     }
 
-    // If no recipe for the output: return N/A (prevents “profit” from spread)
+    // If no recipe for the output: return N/A
     if (!recipe) {
       memoStrict.set(key, "N/A");
       return "N/A";
@@ -551,18 +530,11 @@ function readUsed_(sheet, numCols) {
 }
 
 function applyToInput_(items, fn) {
-  // Accept scalar or range
   if (items == null) return [[""]];
-  if (!Array.isArray(items)) {
-    const v = fn(items);
-    return [[v]];
-  }
-  // 2D range: return 2D
+  if (!Array.isArray(items)) return [[fn(items)]];
   return items.map((row) => {
     const name = row && row.length ? row[0] : "";
     if (!name) return [""];
     return [fn(name)];
   });
 }
-
-
